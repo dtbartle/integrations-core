@@ -43,6 +43,14 @@ class KafkaCheck(AgentCheck):
 
         self.kafka_clients = {}
 
+    def stop(self):
+        """
+        cleanup kafka connections (to all brokers) to avoid leaving
+        stale connections in older kafkas.
+        """
+        for cli in self.kafka_clients.itervalues():
+            cli.close()
+
     def _get_instance_key(self, instance):
         return self.read_config(instance, 'kafka_connect_str')
 
