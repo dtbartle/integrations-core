@@ -3,12 +3,14 @@
 # Licensed under Simplified BSD License (see LICENSE)
 
 # stdlib
+import random
 from collections import defaultdict
 import time
 
 # 3p
 from kafka.client import KafkaClient
 from kafka.protocol.offset import OffsetRequest
+from kafka.protocol.commit import GroupCoordinatorRequest
 from kazoo.client import KazooClient
 from kazoo.exceptions import NoNodeError
 
@@ -39,7 +41,91 @@ class KafkaCheck(AgentCheck):
         self.kafka_timeout = int(
             init_config.get('kafka_timeout', DEFAULT_KAFKA_TIMEOUT))
 
-    def _get_highwater_offsets(self, kafka_hosts_ports):
+        self.kafka_clients = {}
+
+    def _get_instance_key(self, instance):
+        return self.read_config(instance, 'kafka_connect_str')
+
+    def _get_kafka_client(self, instance):
+        kafka_conn_str = self.read_config(instance, 'kafka_connect_str')
+        if not kafka_conn_str:
+            raise Exception('Bad instance')
+
+        instance_key = self._get_instance_key(instance)
+        if kafka_conn_str not in self.kafka_clients:
+            cli = KafkaClient(bootstrap_servers=kafka_conn_str, client_id='dd-agent')
+            self.kafka_clients[instance_key] = cli
+
+        return self.kafka_clients[instance_key]
+
+    def _get_group_coordinator(self, client, group):
+        request = GroupCoordinatorRequest[0](group)
+
+        # not all brokers might return a good response... Try all of them
+        for broker in client.cluster.brokers():
+            try:
+                coord_resp = self._make_blocking_req(client, request, nodeid=broker.nodeId)
+                if coord_resp:
+                    client.cluster.add_group_coordinator(group, coord_resp)
+                    return client.cluster.coordinator_for_group(group)
+            except AssertionError:
+                continue
+
+        return None
+
+    def _get_random_node_id(self, client):
+        brokers = client.cluster.brokers()
+        if not brokers:
+            raise Exception('No known available brokers... make this a specific exception')
+        nodeid = random.sample(brokers, 1)[0].nodeId
+
+    def _make_req_async(self, client, request, nodeid=None, cb=None):
+        if not nodeid:
+            nodeid = self._get_random_node_id(client)
+
+        future = client.send(nodeid, request)
+        if cb:
+            future.add_callback(cb, request, nodeid, self.current_ts)
+
+    def _make_blocking_req(self, client, request, nodeid=None):
+        if not nodeid:
+            nodeid = self._get_random_node_id(client)
+
+        future = client.send(nodeid, request)
+        client.poll(future=future)  # block until we get response.
+        assert future.succeeded()
+        response = future.value
+
+        return response
+
+    def _process_highwater_offsets(self, request, instance, nodeid, response):
+        highwater_offsets = {}
+        topic_partitions_without_a_leader = {}
+
+        instance_key = self._get_instance_key(instance)
+        for topic, partitions in response.topics:
+            for partition, error_code, offsets in partitions:
+                if error_code == 0:
+                    highwater_offsets[(topic, partition)] = offsets[0]
+                    # Valid error codes:
+                    # https://cwiki.apache.org/confluence/display/KAFKA/A+Guide+To+The+Kafka+Protocol#AGuideToTheKafkaProtocol-PossibleErrorCodes.2
+                elif error_code == -1:
+                    self.log.error("Kafka broker returned UNKNOWN (error_code -1) for topic: %s, partition: %s. "
+                                   "This should never happen.", topic, partition)
+                elif error_code == 3:
+                    self.log.warn("Kafka broker returned UNKNOWN_TOPIC_OR_PARTITION (error_code 3) for "
+                                  "topic: %s, partition: %s. This should only happen if the topic is currently being deleted.",
+                                  topic, partition)
+                elif error_code == 6:
+                    self.log.warn("Kafka broker returned NOT_LEADER_FOR_PARTITION (error_code 6) for "
+                                  "topic: %s, partition: %s. This should only happen if the broker that was the partition "
+                                  "leader when kafka_client.cluster last fetched metadata is no longer the leader.",
+                                  topic, partition)
+                    topic_partitions_without_a_leader.append((topic, partition))
+
+            return highwater_offsets, topic_partitions_without_a_leader
+
+    def _get_broker_offsets(self, instance):
         """
         Fetch highwater offsets for each topic/partition from Kafka cluster.
 
@@ -51,25 +137,23 @@ class KafkaCheck(AgentCheck):
         Sends one OffsetRequest per broker to get offsets for all partitions
         where that broker is the leader:
         https://cwiki.apache.org/confluence/display/KAFKA/A+Guide+To+The+Kafka+Protocol#AGuideToTheKafkaProtocol-OffsetAPI(AKAListOffset)
+
+        Can we cleanup connections on agent restart?
+        Brokers before 0.9 - accumulate stale connections on restarts.
+        In 0.9 Kafka added connections.max.idle.ms
+        https://issues.apache.org/jira/browse/KAFKA-1282
         """
-        # We could switch this to a long-lived connection that's cached
-        # on the AgentCheck instance, in which case we don't have to
-        # cleanup the connection. Downside is there's no way to cleanup
-        # connection when agent restarts, so brokers before 0.9 just
-        # accumulate stale connections. In 0.9 Kafka added
-        # connections.max.idle.ms https://issues.apache.org/jira/browse/KAFKA-1282
-        kafka_client = KafkaClient(
-            bootstrap_servers=kafka_hosts_ports,
-            request_timeout_ms=(self.kafka_timeout * 1000))
+
+        # Connect to Kafka
+        highwater_offsets = {}
+        topic_partitions_without_a_leader = []
+        cli = self._get_kafka_client(instance)
         try:
-            highwater_offsets = {}
             # store partitions that exist but unable to fetch offsets for later
             # error checking
-            topic_partitions_without_a_leader = []  # contains (topic, partition) tuples
-            for broker in kafka_client.cluster.brokers():
-                if not kafka_client.ready(broker.nodeId):
-                    time.sleep(0.5)
-                if not kafka_client.ready(broker.nodeId):
+            for broker in cli.cluster.brokers():
+                if not cli.ready(broker.nodeId):
+                    self.log.info('kafka broker unavailable this iteration - skipping')
                     continue
 
                 # Group partitions by topic in order to construct the OffsetRequest
@@ -77,60 +161,27 @@ class KafkaCheck(AgentCheck):
                 # partitions_for_broker returns all partitions for which this
                 # broker is leader. So any partitions that don't currently have
                 # leaders will be missed. Ignore as they'll be caught on next check run.
-                for topic, partition in kafka_client.cluster.partitions_for_broker(broker.nodeId):
+                for topic, partition in cli.cluster.partitions_for_broker(broker.nodeId):
                     partitions_grouped_by_topic[topic].append(partition)
 
-                # Construct the OffsetRequest
-                timestamp = -1  # -1 for latest, -2 for earliest
-                max_offsets = 1
-                highwater_offsets_request = OffsetRequest[0](
-                    replica_id=-1,
-                    topics=[
-                        (topic, [
-                            (partition, timestamp, max_offsets) for partition in partitions])
-                        for topic, partitions in partitions_grouped_by_topic.iteritems()])
+                    # Construct the OffsetRequest
+                    timestamp = -1  # -1 for latest, -2 for earliest
+                    max_offsets = 1
+                    request = OffsetRequest[0](
+                        replica_id=-1,
+                        topics=[
+                            (topic, [
+                                (partition, timestamp, max_offsets) for partition in partitions])
+                            for topic, partitions in partitions_grouped_by_topic.iteritems()])
 
-                # Send each request as a blocking call to keep life simple.
-                # For large clusters, be faster to send all requests and then in a
-                # in a second loop process all responses. But requires bookeeping to
-                # make sure all returned.
-                future = kafka_client.send(broker.nodeId, highwater_offsets_request)
-                kafka_client.poll(future=future)
-                assert future.succeeded()  # safety net, typically only false if request was malformed.
+                response = self._make_blocking_req(cli, request, nodeid=broker.nodeId)
+                offsets, unleaded = self._process_highwater_offsets(request, instance, broker.nodeId, response)
+                highwater_offsets.update(offsets)
+                topic_partitions_without_a_leader.append(unleaded)
+        except Exception:
+            self.log.exception('There was a problem collecting the high watermark offsets')
 
-                highwater_offsets_response = future.value
-                for topic, partitions in highwater_offsets_response.topics:
-                    for partition, error_code, offsets in partitions:
-                        if error_code == 0:
-                            highwater_offsets[(topic, partition)] = offsets[0]
-                        # Valid error codes:
-                        # https://cwiki.apache.org/confluence/display/KAFKA/A+Guide+To+The+Kafka+Protocol#AGuideToTheKafkaProtocol-PossibleErrorCodes.2
-                        elif error_code == -1:
-                            self.log.error("Kafka broker returned UNKNOWN "
-                                "(error_code -1) for topic: %s, partition: %s. "
-                                "This should never happen.",
-                                topic, partition)
-                        elif error_code == 3:
-                            self.log.warn("Kafka broker returned "
-                                "UNKNOWN_TOPIC_OR_PARTITION (error_code 3) for "
-                                "topic: %s, partition: %s. This should only "
-                                "happen if the topic is currently being deleted.",
-                                topic, partition)
-                        elif error_code == 6:
-                            self.log.warn("Kafka broker returned "
-                                "NOT_LEADER_FOR_PARTITION (error_code 6) for "
-                                "topic: %s, partition: %s. This should only "
-                                "happen if the broker that was the partition "
-                                "leader when kafka_client.cluster last fetched "
-                                "metadata is no longer the leader.",
-                                topic, partition)
-                            topic_partitions_without_a_leader.append((topic, partition))
-        finally:
-            try:
-                kafka_client.close()
-            except Exception:
-                self.log.exception('Error cleaning up Kafka connection')
-        return highwater_offsets, topic_partitions_without_a_leader
+        return highwater_offsets, list(set(topic_partitions_without_a_leader))
 
     def _get_zk_path_children(self, zk_conn, zk_path, name_for_error):
         """Fetch child nodes for a given Zookeeper path."""
@@ -234,8 +285,7 @@ class KafkaCheck(AgentCheck):
             zk_hosts_ports, consumer_groups, zk_prefix)
 
         # Fetch the broker highwater offsets
-        kafka_hosts_ports = self.read_config(instance, 'kafka_connect_str')
-        highwater_offsets, topic_partitions_without_a_leader = self._get_highwater_offsets(kafka_hosts_ports)
+        highwater_offsets, topic_partitions_without_a_leader = self._get_broker_offsets(instance)
 
         # Report the broker highwater offset
         for (topic, partition), highwater_offset in highwater_offsets.iteritems():
@@ -255,20 +305,13 @@ class KafkaCheck(AgentCheck):
                 continue
             consumer_lag = highwater_offsets[(topic, partition)] - consumer_offset
             if consumer_lag < 0:
-                # This is a really bad scenario because new messages produced to
-                # the topic are never consumed by that particular consumer
-                # group. So still report the negative lag as a way of increasing
-                # visibility of the error.
-                title = "Consumer lag for consumer negative."
                 message = "Consumer lag for consumer group: {group}, topic: {topic}, " \
                     "partition: {partition} is negative. This should never happen.".format(
                         group=consumer_group,
                         topic=topic,
                         partition=partition
                     )
-                key = "{}:{}:{}".format(consumer_group, topic, partition)
-                self._send_event(title, message, consumer_group_tags, 'consumer_lag', key)
-                self.log.debug(message)
+                self.log.info(message)
 
             self.gauge('kafka.consumer_lag', consumer_lag,
                tags=consumer_group_tags)
@@ -313,15 +356,3 @@ If you omit consumer_groups, you must set the flag 'monitor_unlisted_consumer_gr
 If a value is omitted, the parent value must still be it's expected type (typically a dict).
 """)
 
-    def _send_event(self, title, text, tags, type, aggregation_key):
-        event_dict = {
-            'timestamp': int(time.time()),
-            'source_type_name': self.SOURCE_TYPE_NAME,
-            'msg_title': title,
-            'event_type': type,
-            'msg_text': text,
-            'tags': tags,
-            'aggregation_key': aggregation_key,
-        }
-
-        self.event(event_dict)
