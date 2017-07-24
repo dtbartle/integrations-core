@@ -51,7 +51,7 @@ class Producer(threading.Thread):
             producer.send('dc', b"Clark Kent")
             producer.send('dc', b"Arthur Curry")
             producer.send('dc', b"\xc2ShakalakaBoom")
-            time.sleep(5)
+            time.sleep(1)
 
 
 class Consumer(threading.Thread):
@@ -63,8 +63,12 @@ class Consumer(threading.Thread):
                                  auto_offset_reset='earliest')
         consumer.subscribe(['marvel'])
 
-        for message in consumer:
-            pass
+        while True:
+            try:
+                for message in consumer:
+                    pass
+            except Exception:
+                pass
 
 @attr(requires='kafka_consumer')
 class TestKafka(AgentCheckTest):
