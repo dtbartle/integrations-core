@@ -18,17 +18,16 @@ namespace :ci do
            #{ENV['TRAVIS_BUILD_DIR']}/kafka_consumer/ci/resources/docker-compose-single-broker.yml up -d)
       Wait.for 2181
       Wait.for 9092
-      wait_on_docker_logs('resources_kafka_1', 5, '[Kafka Server 1001], started')
-      wait_on_docker_logs('resources_zookeeper_1', 5, 'NodeExists for /brokers/ids')
+      wait_on_docker_logs('resources_kafka_1', 15, '[Kafka Server 1001], started')
+      wait_on_docker_logs('resources_zookeeper_1', 15, 'NodeExists for /brokers/ids')
       sh %(EXTERNAL_PORT=9091 EXTERNAL_JMX_PORT=9998 CONSUMER_OFFSET_STORAGE=#{kafka_consumer_options} docker-compose -f \
            #{ENV['TRAVIS_BUILD_DIR']}/kafka/ci/resources/docker-compose-single-broker.yml scale kafka=2)
-      wait_on_docker_logs('resources_kafka_2', 5, '[Kafka Server 1002], started')
+      wait_on_docker_logs('resources_kafka_2', 15, '[Kafka Server 1002], started')
     end
 
     task before_script: ['ci:common:before_script'] do
-      wait_on_docker_logs('kafka_consumer', 25, 'boomshakalaka')
       # wait_on_docker_logs('resources_kafka_1', 15, 'Partition [test,0] on broker 1001')
-      wait_on_docker_logs('resources_zookeeper_1', 90, 'Error Path:/consumers/my_consumer/offsets')
+      # wait_on_docker_logs('resources_zookeeper_1', 90, 'Error Path:/consumers/my_consumer/offsets')
     end
 
     task script: ['ci:common:script'] do
