@@ -13,6 +13,9 @@ from nose.plugins.attrib import attr
 from nose import SkipTest
 from kafka import KafkaConsumer, KafkaProducer
 
+from kazoo.client import KazooClient
+from kazoo.exceptions import NoNodeError
+
 # project
 from tests.checks.common import AgentCheckTest
 
@@ -58,17 +61,29 @@ class Consumer(threading.Thread):
     daemon = True
 
     def run(self):
+        # zk_path_consumer = zk_prefix + '/consumers/'
+        # zk_path_topic_tmpl = zk_path_consumer + '{group}/offsets/'
+        # zk_path_partition_tmpl = zk_path_topic_tmpl + '{topic}/'
+
+        # zk_conn = KazooClient(zk_hosts_ports, timeout=self.zk_timeout)
+        # zk_conn.start()
+
         consumer = KafkaConsumer(bootstrap_servers=instance[0]['kafka_connect_str'],
                                  group_id="my_consumer",
-                                 auto_offset_reset='earliest')
-        consumer.subscribe(['marvel'])
+                                 auto_offset_reset='earliest',
+                                 enable_auto_commit=False)
+        consumer.subscribe(['marvel', 'dc'])
+
+
 
         while True:
-            try:
-                for message in consumer:
-                    pass
-            except Exception:
-                pass
+            response = consumer.poll(timeout_ms=500, max_records=10)
+            print "CONSUMER RESPONSE: %s" % response
+
+            offsets = consumer._subscription.all_consumed_offsets()
+            for partition, metadata in offsets:
+                print "PART: %s, META: %s" % (partition, metadata)
+
 
 @attr(requires='kafka_consumer')
 class TestKafka(AgentCheckTest):
