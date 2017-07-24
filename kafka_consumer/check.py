@@ -108,7 +108,7 @@ class KafkaCheck(AgentCheck):
 
     def _process_highwater_offsets(self, request, instance, nodeid, response):
         highwater_offsets = {}
-        topic_partitions_without_a_leader = {}
+        topic_partitions_without_a_leader = []
 
         instance_key = self._get_instance_key(instance)
         for topic, partitions in response.topics:
