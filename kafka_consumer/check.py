@@ -187,7 +187,7 @@ class KafkaCheck(AgentCheck):
                     response = self._make_blocking_req(cli, request, nodeid=broker.nodeId)
                     offsets, unlead = self._process_highwater_offsets(request, instance, broker.nodeId, response)
                     highwater_offsets.update(offsets)
-                    topic_partitions_without_a_leader.append(unlead)
+                    topic_partitions_without_a_leader.extend(unlead)
         except Exception:
             self.log.exception('There was a problem collecting the high watermark offsets')
 
